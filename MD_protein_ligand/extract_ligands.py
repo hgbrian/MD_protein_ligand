@@ -1,5 +1,6 @@
 """
 Adapted from original code from Pat Walters.
+https://gist.github.com/PatWalters/3c0a483c030a2c75cb22c4234f206973
 Split a protein-ligand complex into protein and ligands and assign ligand bond
 orders using SMILES strings from Ligand Export.
 
@@ -22,14 +23,16 @@ import requests
 
 
 LIGAND_EXPO_FILENAME = "Components-smiles-stereo-oe.smi"
-LIGAND_EXPO_URL = f"http://ligand-expo.rcsb.org/dictionaries/{LIGAND_EXPO_FILENAME}"
+# link died! switch to the othe Pat Walters gist
+#LIGAND_EXPO_URL = f"http://ligand-expo.rcsb.org/dictionaries/{LIGAND_EXPO_FILENAME}"
+LIGAND_EXPO_URL = f"https://gist.githubusercontent.com/hgbrian/c06afb12b05f9f587a4863fe260af2fe/raw/{LIGAND_EXPO_FILENAME}"
 
 @cache
 def _read_ligand_expo():
     """
     Read Ligand Expo data, try to find a file called
     Components-smiles-stereo-oe.smi in the current directory.
-    If you can't find the file, grab it from the RCSB (archived in gs://hx-brian 2023-06-11)
+    If you can't find the file, grab it from the RCSB
     :return: Ligand Expo as a dictionary with ligand id as the key
     """
     if not Path(LIGAND_EXPO_FILENAME).exists():
@@ -41,6 +44,28 @@ def _read_ligand_expo():
     df_lig.set_index("ID", inplace=True)
 
     return df_lig.to_dict()
+
+
+def _split_pdb_into_components(pdb_name: str):
+    """
+    Split a PDB file into protein, RNA, DNA, and ligand components
+    
+    Parameters:
+        pdb_name (str): Path or PDB ID of the structure
+        
+    Returns:
+        tuple: (protein, rna, dna, ligand) selections
+    """
+    assert "." not in pdb_name or Path(pdb_name).exists()
+
+    pdb = prody.parsePDB(pdb_name)
+    
+    protein_sel = pdb.select('protein')
+    rna_sel = pdb.select("nucleic and name P C3' C5' O3' O5'")  # RNA-specific atoms
+    dna_sel = pdb.select("nucleic and not (name P C3' C5' O3' O5')")  # DNA-specific atoms
+    ligand_sel = pdb.select('not (protein or nucleic or water)')
+    
+    return protein_sel, rna_sel, dna_sel, ligand_sel
 
 
 def _split_pdb_into_protein_and_ligand(pdb_name:str):
@@ -55,7 +80,7 @@ def _split_pdb_into_protein_and_ligand(pdb_name:str):
     return protein_sel, ligand_sel
 
 
-def _process_ligand(ligand, res_name, chain, ligand_smiles=None):
+def _process_ligand_old(ligand, res_name, chain, ligand_smiles=None):
     """
     Add bond orders to a pdb ligand
     1. Select the ligand component with name "res_name"
@@ -74,7 +99,6 @@ def _process_ligand(ligand, res_name, chain, ligand_smiles=None):
 
     output = StringIO()
     sub_mol = ligand.select(f"resname {res_name} and chain {chain}")
-    print("sub_mol", sub_mol)
     if sub_mol is None:
         warn(f"sub_mol is None for {res_name}")
         return None, None
@@ -100,7 +124,7 @@ def _process_ligand(ligand, res_name, chain, ligand_smiles=None):
     return rd_mol_templated, ligand_smiles
 
 
-def _process_ligand_alt(ligand, res_name, chain, ligand_smiles=None):
+def _process_ligand(ligand, res_name, chain, ligand_smiles=None):
     """
     https://gist.github.com/PatWalters/c046fee2760e6894ed13e19b8c99193b
     Add bond orders to a pdb ligand
@@ -114,14 +138,20 @@ def _process_ligand_alt(ligand, res_name, chain, ligand_smiles=None):
     :param res_name: residue name of ligand to extract
     :return: molecule with bond orders assigned
     """
-    output = StringIO()
     sub_mol = ligand.select(f"resname {res_name} and chain {chain}")
     chem_desc = pypdb.describe_chemical(f"{res_name}")
-    sub_smiles = chem_desc["describeHet"]["ligandInfo"]["ligand"]["smiles"]
+    print("keys", chem_desc.keys())
+    assert chem_desc['rcsb_chem_comp_descriptor']['comp_id'] == res_name, "name mismatch"
+    sub_smiles = chem_desc['rcsb_chem_comp_descriptor']['smilesstereo']
+    print("sub_smiles", sub_smiles)
+    #sub_smiles = chem_desc["describeHet"]["ligandInfo"]["ligand"]["smiles"]
     template = AllChem.MolFromSmiles(sub_smiles)
+    print("template", template)
+    output = StringIO()
     prody.writePDBStream(output, sub_mol)
     pdb_string = output.getvalue()
     rd_mol = AllChem.MolFromPDBBlock(pdb_string)
+
     new_mol = AllChem.AssignBondOrdersFromTemplate(template, rd_mol)
     return new_mol, sub_smiles
 
@@ -182,11 +212,14 @@ def extract_ligand(pdb_name:str, ligand_name:str, ligand_chain:str, out_pdb_file
     print("ligand_name", ligand_name)
 
     if out_sdf_file is None:
-        out_sdf_file = Path(out_pdb_file).with_suffix('') + f"_{ligand_name}.sdf"
+        out_sdf_file = f"{Path(out_pdb_file).with_suffix('')}_{ligand_name}.sdf"
 
     print("ligand_smileses should be None", ligand_smiles)
 
+    # I made sure these produce the same result. Both are from Pat Walters gists!
+    #new_mol, new_mol_smiles = _process_ligand_old(ligand_sel, ligand_name, ligand_chain, ligand_smiles)
     new_mol, new_mol_smiles = _process_ligand(ligand_sel, ligand_name, ligand_chain, ligand_smiles)
+
     if new_mol is None:
         raise ValueError(f"{ligand_name} molecule object is None")
 
@@ -198,23 +231,61 @@ def extract_ligand(pdb_name:str, ligand_name:str, ligand_chain:str, out_pdb_file
 
 
 def extract_all_ligands(pdb_name, out_pdb_name):
-    _, ligand_sel = _split_pdb_into_protein_and_ligand(pdb_name)
-    all_ligand_names_chains = set(zip(ligand_sel.getResnames(), ligand_sel.getChids()))
-    for ligand_name, ligand_chain in all_ligand_names_chains:
-        _ = extract_ligand(pdb_name, ligand_name, ligand_chain, out_pdb_name)
+    """extract the ligands"""
+    _protein_sel, ligand_sel = _split_pdb_into_protein_and_ligand(pdb_name)
 
+    if ligand_sel is None:
+        return []
+
+    all_ligand_names_chains = set(zip(ligand_sel.getResnames(), ligand_sel.getChids()))
+    print(all_ligand_names_chains)
+    outputs = []
+    for ligand_name, ligand_chain in all_ligand_names_chains:
+        outputs.append(extract_ligand(pdb_name, ligand_name, ligand_chain, out_pdb_name))
+    return outputs
+
+def extract_ligand_protein(pdb_name:str, ligand_chain:str, out_pdb_file:str,
+                           out_sdf_file:str|None=None,
+                           ligand_smiles:str|None=None) -> tuple[str, str, str]:
+    """extract the protein"""
+
+    assert Path(pdb_name).exists()
+
+    pdb = prody.parsePDB(pdb_name)
+    protein_sel = pdb.select(f'not chain {ligand_chain}')
+    peptide_sel = pdb.select(f'chain {ligand_chain}')
+
+    print(dir(protein_sel))
+
+    print("protein atoms", protein_sel.numAtoms())
+    print("non protein atoms", peptide_sel.numAtoms())
+
+    return protein_sel
 
 if __name__ == "__main__":
     import argparse
 
+    #pros = extract_ligand_protein("1A1O_reordered.pdb", "B", "out_1A1O_protein.pdb")
+    #ligs = extract_all_ligands("1A1O_reordered.pdb", "lig_1A1O_protein.pdb")
+
+    #x = _split_pdb_into_components("1A1O_reordered.pdb")
+    prot_sel, rna_sel, dna_sel, lig_sel = _split_pdb_into_components("6XRQ")
+    print(x)
+    #print(ligs)
+    1/0                           
     parser = argparse.ArgumentParser(description='Extract ligands from a PDB file.')
     parser.add_argument('pdb_id', type=str, help='PDB ID')
-    parser.add_argument('ligand_names', type=str, help='Comma-delimited list of ligand names')
+    parser.add_argument('--ligand_names', type=str, default=None, help='Comma-delimited list of ligand names')
     parser.add_argument('--chains', type=str, default=None, help='Comma-delimited list of chains for each ligand')
     
     args = parser.parse_args()
-    args_ligand_names = args.ligand_names.split(",")
+    args_ligand_names = args.ligand_names.split(",") if args.ligand_names is not None else None
     args_chains = args.chains.split(",") if args.chains is not None else None
 
-    outputs = extract_ligands(args.pdb_id, args_ligand_names, args_chains)
-    print(outputs)
+    if args_ligand_names is None:
+        outputses = extract_all_ligands(args.pdb_id, f"{args.pdb_id}_protein.pdb")
+        print(outputses)
+    else:
+        for (ligand, chain) in zip(args_ligand_names, args_chains):
+            outputs = extract_ligand(args.pdb_id, ligand, chain, f"{args.pdb_id}_protein.pdb")
+            print(outputs)
